@@ -1,0 +1,506 @@
+
+
+import numpy as np
+import random
+import math
+import xxhash
+import matplotlib.pyplot as plt
+import csv
+import gurobipy as gp
+from gurobipy import GRB
+
+
+def all_count(fake_data: list, ct: list, domain: list):
+    data = []
+    for x in fake_data:
+        # data.append(x[0])
+        data.append(random.choice(x))
+    # print("data:", data)
+    temp = []
+    all_data_count = []
+    d = len(domain)
+    for i in range(d):
+        temp.append(data.count(domain[i]))
+        all_data_count.append(ct[i] + temp[i])
+    return all_data_count
+
+
+def user(epsilon, domain, data_lists):
+    data = []
+    for data_list in data_lists:
+        wu = Wheel_USER(epsilon, domain, data_list)
+        wu.run()
+        data.append(wu.get_per_data())
+    return data
+
+
+def server(epsilon, domain, data, c):
+    ws = Wheel_SERVER(epsilon, domain, data, c)
+    # temp = ws.estimate()
+    return ws.estimate(), ws.get_es_data()
+
+
+def data_estimate(N, c, epsilon, D, Ct, fake_data):
+    k = len(D)
+    Estimate_Dist = [0 for col in range(k)]
+    s = math.exp(epsilon)
+    temp_p = 1 / (2 * c - 1 + c * s)
+    pt = temp_p * s / (c * temp_p * s + (1 - c * temp_p))
+    pf = temp_p
+
+    all_n = N + len(fake_data)
+    # print("总用户人数：", all_n)
+
+    data_list = []
+    for x in fake_data:
+        data_list.append(random.choice(x))
+    temp = []
+    all_data_count = []
+    d = len(domain)
+    for i in range(d):
+        temp.append(data_list.count(domain[i]))
+        all_data_count.append(Ct[i] + temp[i])
+
+    for i in range(k):
+        Estimate_Dist[i] = 1 / all_n * (all_data_count[i] - all_n * pf) / (pt - pf)
+
+    return Estimate_Dist
+
+
+class Wheel_USER(object):
+    def __init__(self, epsilon: float, domain: list, data_list: list):
+        super(Wheel_USER, self).__init__()
+        # 隐私预算
+        self.epsilon = epsilon
+        # 原始数据定义域
+        self.domain = domain
+        # 用户的原始数据
+        self.data_list = data_list
+        # 用户手中数据的数目
+        self.c = len(data_list)
+        # 扰动数据
+        self.per_data = 0
+
+    # N是用户数量
+    # c是数据域大小,也就是用户手中数据的条数
+    # 扰动过程, X为用户的真实数据, 用户输入值的域，epsilon
+    def run(self):
+        # 为了直接将之前的代码拿过来用，特意设置下列值
+        epsilon = self.epsilon
+        c = self.c
+        X = [self.data_list]
+        N = 1
+        # 手动抽取用户所用的hash种子
+        seed = random.randint(0, 100000)
+
+        max_int_32 = (1 << 32) - 1
+        Y = [0 for col in range(N)]
+        s = math.exp(epsilon)
+        temp_p = 1 / (2 * c - 1 + c * s)
+        omega = c * temp_p * s + (1 - c * temp_p)
+        for i in range(N):
+            V = [0 for col in range(c)]
+            # hash
+            for j in range(c):
+                V[j] = xxhash.xxh32_intdigest(str(X[i][j]), seed=seed) / max_int_32
+            # 区间合并的准备工作
+            # 详见论文算法3
+            bSize = math.ceil(1 / temp_p)
+            lef = [0 for col in range(bSize)]
+            rig = [0 for col in range(bSize)]
+            for b in range(bSize):
+                lef[b] = min((b + 1) * temp_p, 1.0)
+                rig[b] = b * temp_p
+            # 算法3 第6行开始
+            for v in V:
+                temp_b = math.ceil(v / temp_p) - 1
+                lef[temp_b] = min(v, lef[temp_b])
+                if temp_b < math.ceil(1 / temp_p) - 1:
+                    rig[temp_b + 1] = max(v + temp_p, rig[temp_b + 1])
+                else:
+                    rig[0] = max(v + temp_p - 1, rig[0])
+            temp_rig0 = rig[0]
+            for b in range(bSize - 1):
+                lef[b] = max(lef[b], rig[b])
+                rig[b] = rig[b + 1]
+            lef[bSize - 1] = max(lef[bSize - 1], rig[bSize - 1])
+            rig[bSize - 1] = temp_rig0 + 1.0
+            # 算法3 21行结束
+            # ll为总长度
+            ll = 0.0
+            for b in range(bSize):
+                ll = ll + rig[b] - lef[b]
+            r = np.random.random_sample()
+            a = 0.0
+            for b in range(bSize):
+                a = a + s * (rig[b] - lef[b]) / omega
+                if a > r:
+                    z = rig[b] - (a - r) * omega / s
+                    break
+                a = a + (omega - ll * s) * (lef[(b + 1) % round(bSize)] + math.floor((b + 1) * temp_p) - rig[b]) / (
+                        (1 - ll) * omega)
+                if a > r:
+                    z = lef[(b + 1) % bSize] - (a - r) * (1 - ll) * omega / (omega - ll * s)
+                    break
+            z = z % 1.0
+            Y[i] = z
+        self.per_data = [seed, Y[0]]
+
+    def get_per_data(self):
+        return self.per_data
+
+
+class Wheel_SERVER(object):
+    def __init__(self, epsilon: float, domain: list, per_datalist: list, c: int):
+        super(Wheel_SERVER, self).__init__()
+        # 隐私预算
+        self.epsilon = epsilon
+        # 原始数据定义域
+        self.domain = domain
+        # 用户数量
+        self.n = len(per_datalist)
+        # 用户手中数据数目
+        self.c = c
+        # 频数统计
+        self.count = []
+        # 频率估计结果
+        self.es_data = []
+
+        # 将用户扰动数据和用户种子拆分
+        # 用户扰动数据集合
+        self.per_datalist = []
+        self.seed = []
+        for x in per_datalist:
+            self.seed.append(x[0])
+            self.per_datalist.append(x[1])
+
+    # Y是所有用户的扰动数据，N是行，c是列，D是原始数据域
+    def estimate(self):
+        Y = self.per_datalist
+        N = self.n
+        c = self.c
+        epsilon = self.epsilon
+        D = self.domain
+
+        max_int_32 = (1 << 32) - 1
+        k = len(D)
+        # Estimate_Dist = [0] * k
+        Estimate_Dist = [0 for col in range(k)]
+        # Estimate_Dist = np.zeros(k, dtype=float)
+        s = math.exp(epsilon)
+        temp_p = 1 / (2 * c - 1 + c * s)
+        for i in range(N):
+            z = Y[i]
+            for j in range(k):
+                x = D[j]
+                v = xxhash.xxh32_intdigest(str(x), seed=self.seed[i]) / max_int_32
+                if z - temp_p < v <= z or z - temp_p + 1 < v < 1:
+                    Estimate_Dist[j] += 1
+        # print("频数：", Estimate_Dist)
+        self.count = Estimate_Dist
+        return self.count
+
+    # 估计频率
+    def get_es_data(self):
+        N = self.n
+        c = self.c
+        epsilon = self.epsilon
+        D = self.domain
+        Ct = self.count
+
+        k = len(D)
+        Estimate_Dist = [0 for col in range(k)]
+        s = math.exp(epsilon)
+        temp_p = 1 / (2 * c - 1 + c * s)
+
+        # 矫正过程
+        pt = temp_p * s / (c * temp_p * s + (1 - c * temp_p))
+        pf = temp_p
+        for i in range(k):
+            Estimate_Dist[i] = 1 / N * (Ct[i] - N * pf) / (pt - pf)
+        # print("频率：", Estimate_Dist)
+        self.es_data = Estimate_Dist
+        return self.es_data
+
+
+def generate_data(domain: list, n: int, c: int):
+    data_user = []  # 所有用户数据
+    for i in range(n):
+        x_raw = random.sample(domain, c)
+        data_user.append(x_raw)
+    return data_user
+
+
+def output_attack(epsilon: float, c: int, r_item: list, r_fre: list, n: int, S_dict):
+    result = []
+    r = len(r_item)
+    r_solve1 = []
+    r_solve2 = []
+    r_solve3 = []
+
+    s = math.exp(epsilon)
+    temp_p = 1 / (2 * c - 1 + c * s)
+    pt = temp_p * s / (c * temp_p * s + (1 - c * temp_p))
+    pf = temp_p
+
+    # r个求解式子
+    for i in range(r):
+        t1 = r_fre[i] * (pt - pf) + pf
+        t2 = (r_fre[i] * (pt - pf) + pf) * n
+        t3 = S_dict[r_item[i]]
+        r_solve1.append(t1)
+        r_solve2.append(t2)
+        r_solve3.append(t3)
+
+    print("r_solve1:", r_solve1)
+    r_solve4 = []
+    for i in range(r):
+        r_solve4.append(r_solve2[i] - r_solve3[i])
+    print("r_solve4:", r_solve4)
+
+    # 用于近似严格不等式的小正数（默认 1e-6）
+    epsilon = 1e-6
+
+    # 创建模型
+    model = gp.Model("Find_Minimal_u")
+
+    # 添加变量 u（正整数）
+    u = model.addVar(vtype=GRB.INTEGER, lb=1, name="u")
+
+    # 设置目标：最小化 u
+    model.setObjective(u, GRB.MINIMIZE)
+
+    # 添加约束：0 < a[i] * u - b[i] < u 对每个 i
+    for i in range(r):
+        a = r_solve1[i]
+        b = r_solve4[i]
+
+        # 约束 1: a[i] * u - b[i] > 0 转换为 a[i] * u - b[i] >= epsilon
+        model.addConstr(a * u + b >= epsilon, name=f"ineq1_{i}")
+
+        # 约束 2: a[i] * u - b[i] < u 转换为 a[i] * u - b[i] <= u - epsilon
+        model.addConstr(a * u + b <= u - epsilon, name=f"ineq2_{i}")
+
+    # 求解模型
+    model.optimize()
+
+    # 检查是否有解
+    if model.status == GRB.OPTIMAL:
+        result.append(int(round(u.X)))  # 返回最小的 u（四舍五入确保整数）
+
+    for i in range(r):
+        tt = round(r_solve1[i] * result[0] + r_solve4[i])
+        result.append(tt)
+
+    print("tt:", result)
+    return result
+
+
+def find_min_positive(numbers):
+    positive_numbers = [num for num in numbers if num > 0]
+    if not positive_numbers:
+        return -1
+    return min(positive_numbers)
+
+
+def generate_fake_data(att_result: list, r_item: list, remain_list: list, c: int):
+    u = att_result[0]
+    l = len(att_result)
+    r_count = list(map(int, att_result[1:l]))  # 每个目标项目增加的次数，元素转为int类型
+    r_dict = dict(zip(r_item, r_count))
+
+    # 假用户的集合
+    fake_data = [[] for _ in range(u)]
+
+    index = 0
+    for (k, v) in r_dict.items():
+        for i in range(v):
+            fake_data[(index + i) % u].append(k)
+        index += v
+
+    # min_count = int(min(r_count))
+    # while min_count >= 0:
+    #     for i in range(min_count):
+    #         fake_data[i].append(r_item[r_count.index(min_count)])
+    #     r_count[r_count.index(min_count)] = -1
+    #     min_count = int(find_min_positive(r_count))
+
+    for x in fake_data:
+        if len(x) < c:
+            # temp = padding_list[:(c - len(x))]
+            temp = random.sample(remain_list, c - len(x))
+            for j in temp:
+                x.append(j)
+        if len(x) > c:
+            temp = random.sample(x, c)
+            fake_data[fake_data.index(x)] = temp
+
+    return fake_data
+
+
+def generate_fake_data_wheel(att_result: list, r_item: list, remain_list: list, c: int):
+    u = att_result[0]
+    l = len(att_result)
+    r_count = list(map(int, att_result[1:l]))  # 每个目标项目增加的次数，元素转为int类型
+    r_dict = dict(zip(r_item, r_count))
+
+    # 假用户的集合
+    if sum(r_count) > u:
+        u = sum(r_count)
+        fake_data = [[] for _ in range(u)]
+        index = 0
+        for (k, v) in r_dict.items():
+            for i in range(v):
+                fake_data[(index + i) % u].append(k)
+            index += v
+
+    else:
+        fake_data = [[] for _ in range(u)]
+        index = 0
+        for (k, v) in r_dict.items():
+            for i in range(v):
+                fake_data[(index + i) % u].append(k)
+            index += v
+
+        for x in fake_data:
+            if len(x) == 0:
+                temp = random.sample(remain_list, 1)
+                for j in temp:
+                    x.append(j)
+
+    return fake_data
+
+
+def normalization(frequency: list, m: int):
+    frequency_min = min(frequency)
+    f_sum = 0
+    frequency_new = []
+    for f in frequency:
+        f_sum = f_sum + (f - frequency_min)
+    for f in frequency:
+        f = ((f - frequency_min) / f_sum) * m
+        frequency_new.append(f)
+    return frequency_new
+
+
+def calculate_column_averages(matrix):
+    row_count = len(matrix)
+    if row_count == 0:
+        return []
+    col_count = len(matrix[0])
+    column_averages = [0] * col_count
+    for row in matrix:
+        for i, value in enumerate(row):
+            column_averages[i] += value
+    for i in range(col_count):
+        column_averages[i] /= row_count
+    return column_averages
+
+
+def round_list_values(lst):
+    rounded_values = [round(value, 3) for value in lst]
+    return rounded_values
+
+
+def calculate_mse(list1, list2):
+    if len(list1) != len(list2):
+        raise ValueError("两个列表的长度不相等")
+    squared_errors = [(x - y) ** 2 for x, y in zip(list1, list2)]
+    mse = sum(squared_errors) / len(list1)
+    return mse
+
+
+def calculate_column_variance(matrix):
+    arr = np.array(matrix)
+    variances = np.var(arr, axis=0)
+    return variances.tolist()
+
+
+def Adjust_value(epsilon, r_item, r_true_fre, a):
+
+    s = math.exp(epsilon)
+    temp_p = 1 / (2 * c - 1 + c * s)
+    p = temp_p * s / (c * temp_p * s + (1 - c * temp_p))
+    q = temp_p
+
+    r = len(r_item)
+    D = [0 for col in range(r)]
+
+    for i in range(r):
+        D[i] = (r_true_fre[i]*p*(1-p) + (1-r_true_fre[i])*q*(1-q)) / (n * (p-q)**2)
+
+    result = []
+    for i in range(r):
+        result.append(math.sqrt(D[i] / (10 * (1 - a))))
+
+    return result
+
+
+def trur_frequency(r_item, domain, data):
+    data_list = []
+    for x in data:
+        data_list.extend(x)
+
+    d = len(domain)
+    temp = []
+    for i in range(d):
+        temp.append(data_list.count(domain[i]))
+
+    num = len(data)
+    result = []
+    for i in range(d):
+        result.append(temp[i]/num)
+
+    item_fre = []
+    for x in r_item:
+        inx = domain.index(x)
+        item_fre.append(result[inx])
+
+    return item_fre
+
+
+# 读入csv数据
+def read_csv_to_int_lists(file_path):
+    big_list = []
+    with open(file_path, mode='r', encoding='utf-8-sig') as file:  # utf-8-sig 处理可能的BOM头
+        csv_reader = csv.reader(file)
+        for row in csv_reader:
+            # 过滤空字符串并转换为整数
+            int_list = [int(x) for x in row if x.strip()]  # 关键修改：跳过空值
+            big_list.append(int_list)
+    return big_list
+
+
+# 截断和填充
+def process_sublists(big_list, c, data_range=(0, 1656)):
+    min_val, max_val = data_range
+    new_big_list = []
+
+    for sublist in big_list:
+        # 去重（确保小列表内元素唯一）
+        unique_elements = list(set(sublist))
+
+        # 情况1：长度超过10，随机保留10个
+        if len(unique_elements) > c:
+            new_sublist = random.sample(unique_elements, c)
+
+        # 情况2：长度不足10，补充随机数
+        else:
+            # 可用的补充数字 = 数据域范围 - 小列表已有数字
+            available_numbers = set(range(min_val, max_val + 1)) - set(unique_elements)
+            needed = c - len(unique_elements)
+
+            # 随机选择补充数字
+            if len(available_numbers) >= needed:
+                supplements = random.sample(available_numbers, needed)
+            else:
+                # 如果数据域不足以补充（理论上不会发生，因数据域有1657个数）
+                supplements = list(available_numbers)
+
+            new_sublist = unique_elements + supplements
+
+        new_big_list.append(new_sublist)
+
+    return new_big_list
+
+
